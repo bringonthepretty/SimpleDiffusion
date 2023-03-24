@@ -8,6 +8,7 @@ import org.deeplearning4j.nn.conf.layers.*;
 import org.deeplearning4j.nn.weights.WeightInit;
 import org.nd4j.linalg.activations.Activation;
 import org.deeplearning4j.nn.graph.ComputationGraph;
+import org.nd4j.linalg.activations.impl.ActivationSoftmax;
 import org.nd4j.linalg.learning.config.Adam;
 import org.nd4j.linalg.lossfunctions.LossFunctions;
 
@@ -23,12 +24,13 @@ public class UNet {
     private static final Integer[] upChannels = new Integer[]{SAMPLING_SIZE_BASE * 16, SAMPLING_SIZE_BASE * 8, SAMPLING_SIZE_BASE * 4, SAMPLING_SIZE_BASE * 2, SAMPLING_SIZE_BASE};
     private static final Integer OUTPUT_DIMENSION = 1;
     private static final Integer COMPUTATION_GRAPH_SEED = 1124124;
+    private static final Double LEARNING_RATE = 1e-5;
 
     private static final String INPUT_LAYER_NAME = "input";
     private static final String OUTPUT_LAYER_NAME = "output";
-    private static final String INPUT_POSITION_EMBEDDING_LAYER_NAME = "input_position_embedding";
-    private static final String INITIAL_CONVOLUTION_LAYER_NAME = "initial_convolution_layer";
-    private static final String FINAL_CONVOLUTION_LAYER_NAME = "final_convolution_layer";
+    private static final String SOFTMAX_ACTIVATION_LAYER_NAME = "softmax_activation_layer";
+
+    private static final String INPUT_POSITION_EMBEDDING_64_LAYER_NAME = "input_position_embedding_64";
 
     private static final String CONVOLUTION_LAYER_BASE_NAME = "convolution_layer:";
     private static final String SUBSAMPLING_LAYER_BASE_NAME = "subsampling_layer:";
@@ -38,6 +40,7 @@ public class UNet {
 
     private static final String SUBSAMPLING_BLOCK_NAME = "subsampling_block-";
     private static final String UPSAMPLING_BLOCK_NAME = "upsampling_block-";
+    private static final String MIDDLE_BLOCK_NAME = "middle_block-";
 
     private final Deque<String> residualLayers = new ArrayDeque<>();
 
@@ -46,7 +49,7 @@ public class UNet {
         ComputationGraphConfiguration.GraphBuilder graphBuilder = new NeuralNetConfiguration.Builder()
                 .seed(COMPUTATION_GRAPH_SEED)
                 .optimizationAlgo(OptimizationAlgorithm.STOCHASTIC_GRADIENT_DESCENT)
-                .updater(new Adam(1e-6))
+                .updater(new Adam(LEARNING_RATE))
                 .weightInit(WeightInit.XAVIER)
                 .miniBatch(true)
                 .cacheMode(CacheMode.NONE)
@@ -54,25 +57,9 @@ public class UNet {
                 .inferenceWorkspaceMode(WorkspaceMode.ENABLED)
                 .graphBuilder();
 
-        Layer initialConvolutionLayer = new Convolution2D.Builder(3, 3)
-                .stride(1, 1)
-                .nIn(3)
-                .nOut(downChannels[0])
-                .padding(1, 1)
-                .cudnnAlgoMode(ConvolutionLayer.AlgoMode.PREFER_FASTEST)
-                .activation(Activation.RELU)
-                .build();
+        Layer softmaxActivationLayer = new ActivationLayer(new ActivationSoftmax());
 
-        Layer finalConvolutionLayer = new Convolution2D.Builder(1, 1)
-                .nIn(upChannels[3])
-                .nOut(3)
-                .stride(1, 1)
-                .convolutionMode(ConvolutionMode.Same)
-                .cudnnAlgoMode(ConvolutionLayer.AlgoMode.PREFER_FASTEST)
-                .activation(Activation.RELU)
-                .build();
-
-        Layer outputLayer = new OutputLayer.Builder(LossFunctions.LossFunction.L2)
+        Layer outputLayer = new OutputLayer.Builder(LossFunctions.LossFunction.MSE)
                 .nIn(3)
                 .nOut(OUTPUT_DIMENSION)
                 .activation(Activation.IDENTITY)
@@ -81,22 +68,22 @@ public class UNet {
         graphBuilder.allowDisconnected(true);
 
         graphBuilder
-                .addInputs(INPUT_LAYER_NAME, INPUT_POSITION_EMBEDDING_LAYER_NAME)
+                .addInputs(INPUT_LAYER_NAME, INPUT_POSITION_EMBEDDING_64_LAYER_NAME)
                 .setInputTypes(InputType.convolutional(SIZE, SIZE, INPUT_DIMENSIONS), InputType.convolutional(SIZE, SIZE, INPUT_DIMENSIONS));
 
-        graphBuilder.addLayer(INITIAL_CONVOLUTION_LAYER_NAME, initialConvolutionLayer, INPUT_LAYER_NAME, INPUT_POSITION_EMBEDDING_LAYER_NAME);
+        addSubsamplingBlock(graphBuilder, downChannels[0]);
+        addSubsamplingBlock(graphBuilder, downChannels[1]);
+        addSubsamplingBlock(graphBuilder, downChannels[2]);
+        addSubsamplingBlock(graphBuilder, downChannels[3]);
 
-        addBlock(graphBuilder, downChannels[1], true);
-        addBlock(graphBuilder, downChannels[2], true);
-        addBlock(graphBuilder, downChannels[3], true);
-        addBlock(graphBuilder, downChannels[4], true);
+        addMiddleBlock(graphBuilder, downChannels[4]);
 
-        addBlock(graphBuilder, upChannels[1], false);
-        addBlock(graphBuilder, upChannels[2], false);
-        addBlock(graphBuilder, upChannels[3], false);
-        addBlock(graphBuilder, upChannels[4], false);
+        addUpsamplingBlock(graphBuilder, upChannels[1]);
+        addUpsamplingBlock(graphBuilder, upChannels[2]);
+        addUpsamplingBlock(graphBuilder, upChannels[3]);
+        addUpsamplingBlock(graphBuilder, upChannels[4]);
 
-        graphBuilder.addLayer(FINAL_CONVOLUTION_LAYER_NAME, finalConvolutionLayer, graphBuilder.getLastAdded());
+        graphBuilder.addLayer(SOFTMAX_ACTIVATION_LAYER_NAME, softmaxActivationLayer, graphBuilder.getLastAdded());
         graphBuilder.addLayer(OUTPUT_LAYER_NAME, outputLayer, graphBuilder.getLastAdded());
 
         graphBuilder.setOutputs(OUTPUT_LAYER_NAME);
@@ -104,66 +91,67 @@ public class UNet {
         ComputationGraph model = new ComputationGraph(graphBuilder.build());
         model.init();
 
+        System.out.println(model.summary());
+
         return model;
     }
 
-    /**
-     * Adds block of layers to computation graph configuration builder
-     * @param target target computation graph configuration builder
-     * @param nOut number of layers output
-     * @param blockType true for subsampling block, false for upsampling block
-     */
-    private void addBlock(ComputationGraphConfiguration.GraphBuilder target, int nOut, boolean blockType) {
-        String baseName;
+    private void addSubsamplingBlock(ComputationGraphConfiguration.GraphBuilder target, int nOut) {
+        String baseName = SUBSAMPLING_BLOCK_NAME;
         int layerCounter = 1;
 
-        if (blockType) {
-            baseName = SUBSAMPLING_BLOCK_NAME;
-            if (target.getLastAdded().contains(":") && !target.getLastAdded().contains(UPSAMPLING_BLOCK_NAME)) {
-                layerCounter = Integer.parseInt(StringUtils.substringAfter(target.getLastAdded(), ":"));
-                layerCounter++;
-            }
-        } else {
-            baseName = UPSAMPLING_BLOCK_NAME;
-            if (target.getLastAdded().contains(":") && !target.getLastAdded().contains(SUBSAMPLING_BLOCK_NAME)) {
-                layerCounter = Integer.parseInt(StringUtils.substringAfter(target.getLastAdded(), ":"));
-                layerCounter++;
-            }
+        if (target.getLastAdded().contains(":")) {
+            layerCounter = Integer.parseInt(StringUtils.substringAfter(target.getLastAdded(), ":"));
+            layerCounter++;
         }
 
-        Layer significantLayer;
-        if (blockType) {
-            significantLayer = new SubsamplingLayer.Builder(SubsamplingLayer.PoolingType.MAX)
-                    .kernelSize(3, 3)
-                    .stride(2, 2)
-                    .padding(0, 0)
-                    .dilation(1, 1)
-                    .convolutionMode(ConvolutionMode.Same)
-                    .build();
-        } else {
-            significantLayer = new Upsampling2D.Builder(2)
-                    .build();
-        }
+        Layer significantLayer = new SubsamplingLayer.Builder(SubsamplingLayer.PoolingType.MAX)
+                .kernelSize(2, 2)
+                .stride(2, 2)
+                .padding(0, 0)
+                .dilation(1, 1)
+                .convolutionMode(ConvolutionMode.Same)
+                .build();
 
-        if (blockType) {
-            target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded());
-        } else {
-            target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded(), residualLayers.removeLast());
-        }
-
-        target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.SELU), target.getLastAdded());
         target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded());
-
-        if (blockType) {
-            target.addLayer(baseName + SUBSAMPLING_LAYER_BASE_NAME + layerCounter++, significantLayer, target.getLastAdded());
-            target.addLayer(baseName + DROPOUT_LAYER_BASE_NAME + layerCounter, new DropoutLayer.Builder(0.5).build(), target.getLastAdded());
-            residualLayers.addLast(target.getLastAdded());
-        } else {
-            target.addLayer(baseName + UPSAMPLING_LAYER_BASE_NAME + layerCounter++, significantLayer, target.getLastAdded());
-        }
-
+        target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded());
+        target.addLayer(baseName + SUBSAMPLING_LAYER_BASE_NAME + layerCounter++, significantLayer, target.getLastAdded());
+        target.addLayer(baseName + DROPOUT_LAYER_BASE_NAME + layerCounter++, new DropoutLayer.Builder(0.5).build(), target.getLastAdded());
+        residualLayers.addLast(target.getLastAdded());
         target.addLayer(baseName + BATCH_NORMALIZATION_LAYER_BASE_NAME + layerCounter++, getBasicBatchNormalizationLayer(nOut), target.getLastAdded());
         target.addLayer(baseName + BATCH_NORMALIZATION_LAYER_BASE_NAME + layerCounter, getBasicBatchNormalizationLayer(nOut), target.getLastAdded());
+    }
+
+    private void addUpsamplingBlock(ComputationGraphConfiguration.GraphBuilder target, int nOut) {
+        String baseName = UPSAMPLING_BLOCK_NAME;
+        int layerCounter = 1;
+
+        if (target.getLastAdded().contains(":")) {
+            layerCounter = Integer.parseInt(StringUtils.substringAfter(target.getLastAdded(), ":"));
+            layerCounter++;
+        }
+
+        Layer significantLayer = new Upsampling2D.Builder(2)
+                .build();
+
+        target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded());
+        target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded(), residualLayers.removeLast());
+        target.addLayer(baseName + UPSAMPLING_LAYER_BASE_NAME + layerCounter++, significantLayer, target.getLastAdded());
+        target.addLayer(baseName + BATCH_NORMALIZATION_LAYER_BASE_NAME + layerCounter++, getBasicBatchNormalizationLayer(nOut), target.getLastAdded());
+        target.addLayer(baseName + BATCH_NORMALIZATION_LAYER_BASE_NAME + layerCounter, getBasicBatchNormalizationLayer(nOut), target.getLastAdded());
+    }
+
+    private void addMiddleBlock(ComputationGraphConfiguration.GraphBuilder target, int nOut) {
+        String baseName = MIDDLE_BLOCK_NAME;
+        int layerCounter = 1;
+
+        if (target.getLastAdded().contains(":")) {
+            layerCounter = Integer.parseInt(StringUtils.substringAfter(target.getLastAdded(), ":"));
+            layerCounter++;
+        }
+
+        target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter++, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded());
+        target.addLayer(baseName + CONVOLUTION_LAYER_BASE_NAME + layerCounter, getBasicConvolutionLayer(nOut, Activation.RELU), target.getLastAdded());
     }
 
     /**
